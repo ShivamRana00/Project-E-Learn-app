@@ -1,5 +1,7 @@
 /* data.js - Large dataset seeding, fake API, recommendation engine, localStorage-backed */
 
+import { getCourses as apiGetCourses, getCourseById as apiGetCourseById, createCourse as apiCreateCourse, updateCourse as apiUpdateCourse, deleteCourse as apiDeleteCourse, getModules as apiGetModules, getQuiz as apiGetQuiz, enrollApi, unenrollApi, completeModuleApi } from './api/client';
+
 const DB_KEY = "elearn_db";
 const SEED_VER_KEY = "elearn_seed_version";
 const SEED_VERSION = "v1-large";
@@ -10,6 +12,26 @@ const withLatency = async (fn) => {
   await new Promise((r) => setTimeout(r, delay));
   return fn();
 };
+
+// Normalize a Course coming from backend (MySQL) to UI shape used in app
+function normalizeCourse(c) {
+  if (!c) return c;
+  const tagsArr = Array.isArray(c.tags)
+    ? c.tags
+    : (typeof c.tags === 'string' ? c.tags.split(',').map(x => x.trim()).filter(Boolean) : []);
+  return {
+    id: c.id,
+    title: c.title || '',
+    description: c.description || '',
+    difficulty: c.difficulty || 'Beginner',
+    tags: tagsArr,
+    enrollCount: typeof c.enrollCount === 'number' ? c.enrollCount : 0,
+    quizId: c.quizId || 'quiz_' + c.id,
+    // UI expects arrays below; backend v1 doesn't store them yet
+    outcomes: Array.isArray(c.outcomes) ? c.outcomes : [],
+    modules: Array.isArray(c.modules) ? c.modules : []
+  };
+}
 
 const uid = (p = "id") => `${p}_${Math.random().toString(36).slice(2, 9)}`;
 const todayISO = () => new Date().toISOString().slice(0, 10);
@@ -248,8 +270,29 @@ export async function updateUser(token, partial) {
   });
 }
 
-export async function listCourses() { return withLatency(() => loadDB().courses); }
+export async function listCourses() {
+  const list = await apiGetCourses();
+  return Array.isArray(list) ? list.map(normalizeCourse) : [];
+}
 export async function getCourse(courseId) {
+  const idStr = String(courseId);
+  const isNumeric = /^\d+$/.test(idStr);
+  if (isNumeric) {
+    const c = await apiGetCourseById(Number(courseId));
+    const norm = normalizeCourse(c);
+    try {
+      const modules = await apiGetModules(Number(courseId));
+      norm.modules = Array.isArray(modules) ? modules.map((m, idx) => ({
+        id: m.id,
+        title: m.title,
+        content: m.content || '',
+        estimatedMin: typeof m.estimatedMin === 'number' ? m.estimatedMin : 10,
+        position: m.position ?? (idx+1)
+      })) : [];
+    } catch {}
+    return norm;
+  }
+  // Fallback to legacy local dataset for non-numeric client IDs like "c_java"
   return withLatency(() => {
     const db = loadDB();
     const c = db.courses.find(x => x.id === courseId);
@@ -259,62 +302,106 @@ export async function getCourse(courseId) {
 }
 
 export async function enrollInCourse(token, courseId) {
-  return withLatency(() => {
-    const ses = getToken();
-    if (!ses || ses.token !== token) throw new Error("Not authenticated");
-    const db = loadDB();
-    const user = db.users.find(u => u.id === ses.userId);
-    if (!user) throw new Error("User not found");
-    if (!user.enrollments[courseId]) user.enrollments[courseId] = { completed: [], lastModuleId: null, quizScores: [] };
-    saveDB(db);
-    return true;
-  });
+  const ses = getToken(); if (!ses || ses.token !== token) throw new Error("Not authenticated");
+  const db = loadDB(); const user = db.users.find(u => u.id === ses.userId); if (!user) throw new Error("User not found");
+  const email = user.username; // dataset stores email in username
+  try { await enrollApi(email, Number.isFinite(courseId) ? courseId : Number(courseId)); } catch {}
+  // local sync for UI
+  if (!user.enrollments[courseId]) user.enrollments[courseId] = { completed: [], lastModuleId: null, quizScores: [] };
+  saveDB(db);
+  return true;
 }
 
 export async function unenrollFromCourse(token, courseId) {
-  return withLatency(() => {
-    const ses = getToken(); if (!ses || ses.token !== token) throw new Error("Not authenticated");
-    const db = loadDB(); const user = db.users.find(u => u.id === ses.userId);
-    if (!user) throw new Error("User not found");
-    delete user.enrollments[courseId]; saveDB(db); return true;
-  });
+  const ses = getToken(); if (!ses || ses.token !== token) throw new Error("Not authenticated");
+  const db = loadDB(); const user = db.users.find(u => u.id === ses.userId); if (!user) throw new Error("User not found");
+  const email = user.username;
+  try { await unenrollApi(email, Number.isFinite(courseId) ? courseId : Number(courseId)); } catch {}
+  delete user.enrollments[courseId]; saveDB(db); return true;
 }
 
 export async function markModuleComplete(token, courseId, moduleId) {
-  return withLatency(() => {
-    const ses = getToken(); if (!ses || ses.token !== token) throw new Error("Not authenticated");
-    const db = loadDB(); const user = db.users.find(u => u.id === ses.userId);
-    const course = db.courses.find(c => c.id === courseId);
-    if (!user || !course) throw new Error("Not found");
-    if (!user.enrollments[courseId]) user.enrollments[courseId] = { completed: [], lastModuleId: null, quizScores: [] };
-    const e = user.enrollments[courseId];
-    if (!e.completed.includes(moduleId)) e.completed.push(moduleId);
-    e.lastModuleId = moduleId;
-    user.points = (user.points || 0) + 5;
-    user.badges = evaluateBadges(user, course, null);
-    user.lastActive = Array.from(new Set([...(user.lastActive || []), todayISO()]));
-    saveDB(db);
-    return { progress: courseProgress(e, course), points: user.points, badges: user.badges };
-  });
+  const ses = getToken(); if (!ses || ses.token !== token) throw new Error("Not authenticated");
+  const db = loadDB(); const user = db.users.find(u => u.id === ses.userId); const course = db.courses.find(c => c.id === courseId);
+  if (!user || !course) throw new Error("Not found");
+  const email = user.username;
+  try { await completeModuleApi(email, Number.isFinite(courseId) ? courseId : Number(courseId), String(moduleId)); } catch {}
+  // local sync
+  if (!user.enrollments[courseId]) user.enrollments[courseId] = { completed: [], lastModuleId: null, quizScores: [] };
+  const e = user.enrollments[courseId];
+  if (!e.completed.includes(moduleId)) e.completed.push(moduleId);
+  e.lastModuleId = moduleId;
+  user.points = (user.points || 0) + 5;
+  user.badges = evaluateBadges(user, course, null);
+  user.lastActive = Array.from(new Set([...(user.lastActive || []), todayISO()]));
+  saveDB(db);
+  return { progress: courseProgress(e, course), points: user.points, badges: user.badges };
 }
 
-export async function getQuiz(quizId) { return withLatency(() => {
-  const db = loadDB(); const q = db.quizzes.find(x => x.id === quizId); if (!q) throw new Error("Quiz not found"); return q; }); }
+export async function getQuiz(quizId) {
+  // Try backend first
+  try {
+    const res = await apiGetQuiz(quizId);
+    const mapped = {
+      id: res.id,
+      courseId: res.courseId,
+      questions: (res.questions || []).map(q => ({
+        id: q.id,
+        type: q.type,
+        question: q.question,
+        options: Array.isArray(q.options) ? q.options : [],
+        // unify to 'answer' key expected by UI
+        answer: q.type === 'mcq' ? q.answer : q.answerBool,
+        explanation: 'Review notes.',
+        difficulty: q.difficulty || 'easy',
+        tags: []
+      }))
+    };
+    return mapped;
+  } catch (e) {
+    // Fallback to legacy local dataset
+    return withLatency(() => {
+      const db = loadDB();
+      const q = db.quizzes.find(x => x.id === quizId);
+      if (!q) throw new Error("Quiz not found");
+      return q;
+    });
+  }
+}
 
 export async function submitQuiz(token, quizId, answers) {
-  return withLatency(() => {
-    const ses = getToken(); if (!ses || ses.token !== token) throw new Error("Not authenticated");
-    const db = loadDB(); const quiz = db.quizzes.find(q => q.id === quizId); if (!quiz) throw new Error("Quiz not found");
-    const user = db.users.find(u => u.id === ses.userId); const course = db.courses.find(c => c.quizId === quizId);
-    let correct = 0; quiz.questions.forEach(q => { const ans = answers[q.id]; if (q.type === "mcq" && typeof ans === "number") { if (ans === q.answer) correct++; } else if (q.type === "tf" && typeof ans === "boolean") { if (ans === q.answer) correct++; } });
-    const percent = Math.round((correct / quiz.questions.length) * 100);
-    const pointsEarned = correct * 10; user.points = (user.points || 0) + pointsEarned;
-    if (!user.enrollments[course.id]) user.enrollments[course.id] = { completed: [], lastModuleId: null, quizScores: [] };
-    const e = user.enrollments[course.id]; e.quizScores = [...(e.quizScores || []), { quizId, score: percent, date: todayISO() }];
-    user.badges = evaluateBadges(user, course, { percent }); user.lastActive = Array.from(new Set([...(user.lastActive || []), todayISO()]));
-    saveDB(db);
-    return { percent, pointsEarned, totalPoints: user.points, badges: user.badges };
-  });
+  // Try backend first
+  try {
+    const { submitQuizApi } = await import('./api/client');
+    const res = await submitQuizApi(quizId, answers);
+    // Local session updates to keep UI points/badges in sync (best-effort)
+    const ses = getToken(); if (ses && ses.token === token) {
+      const db = loadDB(); const user = db.users.find(u => u.id === ses.userId); const course = db.courses.find(c => c.quizId === quizId);
+      if (user && course) {
+        user.points = (user.points || 0) + (res.pointsEarned || 0);
+        if (!user.enrollments[course.id]) user.enrollments[course.id] = { completed: [], lastModuleId: null, quizScores: [] };
+        const e = user.enrollments[course.id]; e.quizScores = [...(e.quizScores || []), { quizId, score: res.percent, date: todayISO() }];
+        user.badges = evaluateBadges(user, course, { percent: res.percent }); user.lastActive = Array.from(new Set([...(user.lastActive || []), todayISO()]));
+        saveDB(db);
+      }
+    }
+    return { percent: res.percent, pointsEarned: res.pointsEarned, totalPoints: (loadDB().users.find(u=>u.id===getToken()?.userId)?.points)||0, badges: (loadDB().users.find(u=>u.id===getToken()?.userId)?.badges)||[] };
+  } catch (e) {
+    // Fallback to legacy local calculation
+    return withLatency(() => {
+      const ses = getToken(); if (!ses || ses.token !== token) throw new Error("Not authenticated");
+      const db = loadDB(); const quiz = db.quizzes.find(q => q.id === quizId); if (!quiz) throw new Error("Quiz not found");
+      const user = db.users.find(u => u.id === ses.userId); const course = db.courses.find(c => c.quizId === quizId);
+      let correct = 0; quiz.questions.forEach(q => { const ans = answers[q.id]; if (q.type === "mcq" && typeof ans === "number") { if (ans === q.answer) correct++; } else if (q.type === "tf" && typeof ans === "boolean") { if (ans === q.answer) correct++; } });
+      const percent = Math.round((correct / quiz.questions.length) * 100);
+      const pointsEarned = correct * 10; user.points = (user.points || 0) + pointsEarned;
+      if (!user.enrollments[course.id]) user.enrollments[course.id] = { completed: [], lastModuleId: null, quizScores: [] };
+      const e2 = user.enrollments[course.id]; e2.quizScores = [...(e2.quizScores || []), { quizId, score: percent, date: todayISO() }];
+      user.badges = evaluateBadges(user, course, { percent }); user.lastActive = Array.from(new Set([...(user.lastActive || []), todayISO()]));
+      saveDB(db);
+      return { percent, pointsEarned, totalPoints: user.points, badges: user.badges };
+    });
+  }
 }
 
 export async function getLeaderboard({ page = 1, pageSize = 25, search = "" } = {}) {
@@ -333,31 +420,29 @@ export async function getLeaderboard({ page = 1, pageSize = 25, search = "" } = 
 }
 
 export async function adminCreateCourse(courseObj) {
-  return withLatency(() => {
-    const db = loadDB();
-    const id = uid("c"); const quizId = `quiz_${id}`;
-    const course = { id, title: courseObj.title || "Untitled Course", description: courseObj.description || "", difficulty: courseObj.difficulty || "Beginner", tags: courseObj.tags || [], enrollCount: 0, outcomes: courseObj.outcomes || [], modules: courseObj.modules || [], quizId };
-    db.courses.push(course);
-    // auto quiz
-    const tag = (course.tags[0] || course.title.split(" ")[0] || "General");
-    const diffs = ["easy","medium","hard"];
-    const qs = Array.from({ length: 10 }).map((_, i) => ({ id: uid("q"), type: i%2?"mcq":"tf", question: `${tag} Q${i+1}?`, options: ["A","B","C","D"], answer: i%4, explanation: "Auto.", difficulty: diffs[i%3], tags: course.tags }));
-    db.quizzes.push({ id: quizId, courseId: id, questions: qs });
-    saveDB(db); return course;
-  });
+  // Expecting courseObj fields compatible with backend Course entity
+  const payload = {
+    title: courseObj.title || 'Untitled Course',
+    description: courseObj.description || '',
+    difficulty: courseObj.difficulty || 'Beginner',
+    tags: Array.isArray(courseObj.tags) ? courseObj.tags.join(',') : (courseObj.tags || ''),
+    enrollCount: courseObj.enrollCount ?? 0,
+    quizId: courseObj.quizId || null
+  };
+  const created = await apiCreateCourse(payload);
+  return normalizeCourse(created);
 }
 
 export async function adminUpdateCourse(id, patch) {
-  return withLatency(() => {
-    const db = loadDB(); const idx = db.courses.findIndex(c => c.id === id); if (idx < 0) throw new Error("Course not found");
-    db.courses[idx] = { ...db.courses[idx], ...patch }; saveDB(db); return db.courses[idx];
-  });
+  const payload = { ...patch };
+  if (Array.isArray(payload.tags)) payload.tags = payload.tags.join(',');
+  const updated = await apiUpdateCourse(id, payload);
+  return normalizeCourse(updated);
 }
 
 export async function adminDeleteCourse(id) {
-  return withLatency(() => {
-    const db = loadDB(); db.courses = db.courses.filter(c => c.id !== id); db.quizzes = db.quizzes.filter(q => q.courseId !== id); saveDB(db); return true;
-  });
+  await apiDeleteCourse(id);
+  return true;
 }
 
 export async function getRecommendations(token) {
