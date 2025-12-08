@@ -1,100 +1,128 @@
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
+const DEFAULT_TIMEOUT = 10000; // 10s
+
+function buildErrorMessage(status, statusText, bodyText) {
+  // Try to parse JSON error for better messages
+  try {
+    const obj = JSON.parse(bodyText);
+    const parts = [];
+    if (obj.message) parts.push(obj.message);
+    else if (obj.error) parts.push(obj.error);
+    else if (obj.title) parts.push(obj.title);
+    if (obj.path) parts.push(`Path: ${obj.path}`);
+    const core = parts.join(' | ');
+    if (core) return `${status} ${statusText || ''}`.trim() + `: ${core}`;
+  } catch {}
+  const text = (bodyText || '').trim();
+  if (text) return `${status} ${statusText || ''}`.trim() + `: ${text}`;
+  return `${status} ${statusText || 'Error'}`;
+}
 
 async function handle(res) {
   if (!res.ok) {
-    let msg = 'Request failed';
-    try { const t = await res.text(); if (t) msg = t; } catch {}
-    throw new Error(msg);
+    let body = '';
+    try { body = await res.text(); } catch {}
+    throw new Error(buildErrorMessage(res.status, res.statusText, body));
   }
   const ct = res.headers.get('content-type') || '';
   if (ct.includes('application/json')) return res.json();
   return res.text();
 }
 
+async function request(url, options = {}, timeoutMs = DEFAULT_TIMEOUT) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    return await handle(res);
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      throw new Error('Network timeout. Please try again.');
+    }
+    // Network or other fetch error
+    if (err instanceof TypeError) {
+      throw new Error('Network error: ' + (err.message || 'Failed to connect'));
+    }
+    throw err;
+  } finally {
+    clearTimeout(id);
+  }
+}
+
 export async function getHello() {
-  const res = await fetch('/api/hello');
-  return handle(res);
+  return request('/api/hello');
 }
 
 // Courses API
 export async function getCourses() {
-  const res = await fetch('/api/courses');
-  return handle(res);
+  return request('/api/courses');
 }
 
 export async function getCourseById(id) {
-  const res = await fetch(`/api/courses/${id}`);
-  return handle(res);
+  return request(`/api/courses/${id}`);
 }
 
 export async function createCourse(course) {
-  const res = await fetch('/api/courses', {
+  return request('/api/courses', {
     method: 'POST',
     headers: JSON_HEADERS,
     body: JSON.stringify(course)
   });
-  return handle(res);
 }
 
 export async function updateCourse(id, patch) {
-  const res = await fetch(`/api/courses/${id}`, {
+  return request(`/api/courses/${id}`, {
     method: 'PATCH',
     headers: JSON_HEADERS,
     body: JSON.stringify(patch)
   });
-  return handle(res);
 }
 
 export async function deleteCourse(id) {
-  const res = await fetch(`/api/courses/${id}`, { method: 'DELETE' });
-  if (!res.ok && res.status !== 204) return handle(res);
+  // DELETE may return 204 No Content
+  const res = await request(`/api/courses/${id}`, { method: 'DELETE' }).catch((e) => { throw e; });
+  return res;
 }
 
 // Quiz API
 export async function getQuiz(quizId) {
-  const res = await fetch(`/api/quizzes/${quizId}`);
-  return handle(res);
+  return request(`/api/quizzes/${quizId}`);
 }
 
 // Modules API
 export async function getModules(courseId) {
-  const res = await fetch(`/api/courses/${courseId}/modules`);
-  return handle(res);
+  return request(`/api/courses/${courseId}/modules`);
 }
 
 export async function submitQuizApi(quizId, answers) {
-  const res = await fetch(`/api/quizzes/${quizId}/submit`, {
+  return request(`/api/quizzes/${quizId}/submit`, {
     method: 'POST',
     headers: JSON_HEADERS,
     body: JSON.stringify({ answers })
   });
-  return handle(res);
 }
 
 // Enrollment APIs
 export async function enrollApi(email, courseId) {
-  const res = await fetch('/api/enrollments/enroll', {
+  return request('/api/enrollments/enroll', {
     method: 'POST',
     headers: JSON_HEADERS,
     body: JSON.stringify({ email, courseId })
   });
-  return handle(res);
 }
 
 export async function unenrollApi(email, courseId) {
-  const res = await fetch('/api/enrollments/unenroll', {
+  return request('/api/enrollments/unenroll', {
     method: 'POST',
     headers: JSON_HEADERS,
     body: JSON.stringify({ email, courseId })
   });
-  return handle(res);
 }
 
 export async function completeModuleApi(email, courseId, moduleId) {
-  const res = await fetch('/api/enrollments/complete', {
+  return request('/api/enrollments/complete', {
     method: 'POST',
     headers: JSON_HEADERS,
     body: JSON.stringify({ email, courseId, moduleId })
   });
-  return handle(res);
 }
