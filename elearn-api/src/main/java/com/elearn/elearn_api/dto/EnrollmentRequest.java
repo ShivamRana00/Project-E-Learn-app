@@ -6,4 +6,6 @@ import lombok.Data;
 public class EnrollmentRequest {
     private String email;
     private Long courseId;
+    private String enrollmentId;
+    private String userId;
 }
